@@ -128,6 +128,95 @@ def _format_agent_output(model_output: AgentOutput) -> str:
     return content.strip()
 
 
+def _require_gateway_key(request: Optional[gr.Request]) -> None:
+    expected = os.getenv("BROWSER_USE_INTERNAL_API_KEY", "").strip()
+    if not expected:
+        return
+    actual = ""
+    if request and request.headers:
+        actual = request.headers.get("x-gateway-key", "")
+    if actual != expected:
+        raise gr.Error("invalid_gateway_key")
+
+
+async def _api_assistant_callback(query: str, browser_context: BrowserContext) -> Dict[str, Any]:
+    """Fallback response for ask_assistant when running via API."""
+    return {"response": "No user available. Continue with best effort."}
+
+
+async def run_agent_api(
+    task: str,
+    provider: str,
+    model_name: str,
+    temperature: float,
+    max_steps: int,
+    headless: bool,
+    request: Optional[gr.Request] = None,
+) -> Dict[str, Any]:
+    """Minimal API entrypoint for gateway calls."""
+    _require_gateway_key(request)
+    if not task or not task.strip():
+        raise gr.Error("task_required")
+
+    llm = await _initialize_llm(
+        provider=provider,
+        model_name=model_name,
+        temperature=temperature,
+        base_url=None,
+        api_key=None,
+        num_ctx=16000,
+    )
+    if llm is None:
+        raise gr.Error("llm_not_configured")
+
+    controller = CustomController(ask_assistant_callback=_api_assistant_callback)
+    browser = CustomBrowser(
+        config=BrowserConfig(
+            headless=headless,
+            new_context_config=BrowserContextConfig(
+                window_width=1280,
+                window_height=900,
+            ),
+        )
+    )
+    context = await browser.new_context(
+        config=BrowserContextConfig(
+            window_width=1280,
+            window_height=900,
+        )
+    )
+
+    agent = BrowserUseAgent(
+        task=task,
+        llm=llm,
+        browser=browser,
+        browser_context=context,
+        controller=controller,
+        use_vision=True,
+        source="api",
+    )
+
+    try:
+        history = await agent.run(max_steps=max_steps)
+        final_text = history.final_result() or ""
+        errors = history.errors() or []
+        success = bool(final_text) and not any(errors)
+        return {
+            "success": success,
+            "finalText": final_text,
+            "errors": errors,
+        }
+    finally:
+        try:
+            await context.close()
+        except Exception:
+            pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
 # --- Updated Callback Implementation ---
 
 
@@ -1021,6 +1110,21 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
                 type="filepath",
             )
 
+        # Hidden API inputs/outputs for gateway integration
+        with gr.Column(visible=False):
+            api_task = gr.Textbox(value="", label="api_task")
+            api_provider = gr.Dropdown(
+                choices=["openai", "ollama", "anthropic", "google", "deepseek", "mistral", "azure_openai"],
+                value="openai",
+                label="api_provider",
+            )
+            api_model = gr.Textbox(value="gpt-4o", label="api_model")
+            api_temperature = gr.Slider(minimum=0.0, maximum=2.0, value=0.2, step=0.1, label="api_temperature")
+            api_max_steps = gr.Number(value=20, precision=0, label="api_max_steps")
+            api_headless = gr.Checkbox(value=True, label="api_headless")
+            api_output = gr.JSON(label="api_output")
+            api_trigger = gr.Button(value="api_trigger")
+
     # --- Store Components in Manager ---
     tab_components.update(
         dict(
@@ -1065,6 +1169,14 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
         """Wrapper for handle_clear."""
         update_dict = await handle_clear(webui_manager)
         yield update_dict
+
+    # Expose minimal API for gateway (Gradio /api/run_agent_api)
+    api_trigger.click(
+        fn=run_agent_api,
+        inputs=[api_task, api_provider, api_model, api_temperature, api_max_steps, api_headless],
+        outputs=[api_output],
+        api_name="run_agent_api",
+    )
 
     # --- Connect Event Handlers using the Wrappers --
     run_button.click(
